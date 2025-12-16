@@ -13,8 +13,8 @@ import torch.optim as optim
 from typing import Tuple, List, Dict, Optional, Any
 import copy
 
-from .networks import PolicyNet, QValueNet
-from .replay_buffer import ReplayBuffer
+from networks import PolicyNet, QValueNet
+from replay_buffer import ReplayBuffer
 import torch.nn.functional as F
 
 # OU 噪声类 (保持不变)

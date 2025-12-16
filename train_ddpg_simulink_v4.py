@@ -128,11 +128,6 @@ def train_ddpg_simulink(
     min_noise = hyperparams['Min Noise']
     noise_decay = hyperparams['Noise Decay']
 
-    # === 新增：引导概率参数 ===
-    guide_prob = 1.0       # 初始 100% 由专家引导
-    min_guide_prob = 0.0   # 最终 0% 引导
-    guide_decay = 0.99     # 衰减速度 (根据需要调整)
-
     print("\n========== 开始训练 ==========")
     
     for episode in range(max_episodes):
@@ -155,33 +150,8 @@ def train_ddpg_simulink(
         actor_grads = []
         
         while True:
-            if episode < 20:
-                guide_prob = 1.0
-            else:
-                if guide_prob < 0.01:
-                    guide_prob = 0.0
-                else:
-                    guide_prob = max(min_guide_prob, guide_prob * guide_decay)
-            # 1. 决定是谁在开车？(掷骰子)
-            use_expert = random.random() < guide_prob
             
-            if use_expert:
-                # A. 专家开车 (Teacher)
-                # 获取当前步数 (假设 env.current_step 可以直接访问，或者自己维护 step_count)
-                current_step_in_env = env.current_step 
-                ref_torque = get_reference_torque(current_step_in_env, max_torque)
-        
-                # [关键修复] 确保物理扭矩不越界，且归一化后在 [0, 1]
-                ref_torque = np.clip(ref_torque, 0, max_torque) 
-                action = ref_torque / max_torque # 归一化到 [0, 1] - 直接使用一维数组
-                
-                # 专家动作不需要加噪声 (通常专家策略是确定的)
-                
-            else:
-                # B. Agent 自己开车 (Student)
-                # 正常的 DDPG 流程
-                action = agent.select_action(state, noise_scale=noise_scale)
-
+            action = agent.select_action(state, noise_scale=noise_scale)
             next_state, reward, done, info = env.step(action)
             
             # 存入缓冲区
@@ -248,9 +218,6 @@ def train_ddpg_simulink(
         # 噪声衰减
         noise_scale = max(min_noise, noise_scale * noise_decay)
         writer.add_scalar('Train/Noise_Scale', noise_scale, episode)
-        # 衰减引导概率
-        guide_prob = max(min_guide_prob, guide_prob * guide_decay)
-        writer.add_scalar('Train/Guide_Prob', guide_prob, episode)
 
         # 打印信息
         print(f"Ep {episode+1}/{max_episodes} | Total: {episode_reward:.0f} | "
@@ -273,7 +240,7 @@ def train_ddpg_simulink(
 if __name__ == "__main__":
     setup_seed(42)
     os.makedirs("logs", exist_ok=True)
-    MODEL_PATH = "best_model_save/elite_ddpg_20251215_173439.pt"
+    MODEL_PATH = "best_model_save/elite_ddpg_20251216_114644.pt"
     train_ddpg_simulink(
         pretrained_model_path=None
     )

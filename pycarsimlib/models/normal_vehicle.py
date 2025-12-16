@@ -23,19 +23,24 @@ class NormalVehicle:
     def _define_import_params(self):
         """ define control inputs """
         self.import_label_array = [
-            "IMP_STEER_SW",
+            "IMP_THROTTLE_ENGINE",
             "IMP_PCON_BK",
-            "IMP_THROTTLE_ENGINE"
+            "IMP_MY_OUT_D1_L",
+            "IMP_MY_OUT_D1_R",
+            "IMP_MY_OUT_D2_L",
+            "IMP_MY_OUT_D2_R"
         ]
 
     def _define_export_params(self):
         """ define variables to be observed """
         self.export_label_array = [
-            "XCG_TM",
-            "YCG_TM",
-            "Yaw",
             "Vx",
-            "Ax"
+            "Ax",
+            "AVz",
+            "AVy_L1",
+            "AVy_R1",
+            "AVy_L2",
+            "AVy_R2"
         ]
 
     def get_import_labels(self):

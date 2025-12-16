@@ -187,10 +187,7 @@ class CarsimSimulinkEnv:
         step_val = float(self.current_step)
         throttle = 1.0
 
-<<<<<<< HEAD
         #test_torque = np.array([300+((step_val*0.01)**1)*30, 300+((step_val*0.01)**1)*30, 500+((step_val*0.01)**1.3)*30, 500+((step_val*0.01)**1.3)*30])
-=======
->>>>>>> b81bb02 (	modified:   .gitignore)
         send_data = struct.pack("7d", 
                                 real_torque[0], 
                                 real_torque[1], 
@@ -283,11 +280,7 @@ class CarsimSimulinkEnv:
         # [修改] 基于新索引提取物理量
         vx = state[0]           # km/h
         ax = state[1]           # m/s^2
-<<<<<<< HEAD
         slip = state[2:6] # 假设 Simulink 发来的是 %, 否则去掉 *0.01
-=======
-        slip = state[2:6] * 0.01# 假设 Simulink 发来的是 %, 否则去掉 *0.01
->>>>>>> b81bb02 (	modified:   .gitignore)
         beta = state[6]     # deg偏航角
         
         w = self.weights 
@@ -322,21 +315,11 @@ class CarsimSimulinkEnv:
         excess_RL = np.maximum(0.0, slip_RL - threshold_rear)
         excess_RR = np.maximum(0.0, slip_RR - threshold_rear)
         
-<<<<<<< HEAD
         if vx > 3: # 只有车动起来才算滑移惩罚
             r_slip_FL = w['w_slip'] * excess_FL
             r_slip_FR = w['w_slip'] * excess_FR
             r_slip_RL = w['w_slip'] * excess_RL
             r_slip_RR = w['w_slip'] * excess_RR
-=======
-        slip_penalty_gain = 20.0
-        
-        if vx > 0.5: # 只有车动起来才算滑移惩罚
-             # 前轮惩罚
-            r_slip_front = w['w_slip'] * slip_penalty_gain * np.sum(excess_front)
-            # 后轮惩罚
-            r_slip_rear  = w['w_slip'] * slip_penalty_gain * np.sum(excess_rear)
->>>>>>> b81bb02 (	modified:   .gitignore)
             
             # 总滑移奖励
             r_slip = r_slip_FL + r_slip_FR + r_slip_RL + r_slip_RR

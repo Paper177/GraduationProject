@@ -182,7 +182,5 @@ cython_debug/
 /media
 best_model_save
 ASR模型代码
-<<<<<<< HEAD
 test_results
-=======
->>>>>>> b81bb02 (	modified:   .gitignore)
+logs_PC

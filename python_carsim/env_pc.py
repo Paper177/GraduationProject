@@ -1,280 +1,256 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-速度追踪版 (直接CarsimManager通信版)
-更新点：
-1. 移除UDP通信，直接使用CarsimManager与CarSim通信。
-2. 索引映射更新。
-"""
+# env_pc.py
+from attr import s
 import numpy as np
 from datetime import timedelta
 from typing import Dict, Tuple, Optional, Any
+import os
 from pycarsimlib.core import CarsimManager
 
-class CarsimSimulinkEnv:
-    # 车辆控制信号名称常量
-    STEERING_SIGNAL = "IMP_STEER_SW"  # 方向盘转角信号
-    BRAKE_SIGNAL = "IMP_PCON_BK"     # 制动主缸油压信号
-    THROTTLE_SIGNAL = "IMP_THROTTLE_ENGINE"  # 油门信号
-    TORQUE_SIGNAL_FL = "IMP_TORQUE_FL"  # 左前轮扭矩信号
-    TORQUE_SIGNAL_FR = "IMP_TORQUE_FR"  # 右前轮扭矩信号
-    TORQUE_SIGNAL_RL = "IMP_TORQUE_RL"  # 左后轮扭矩信号
-    TORQUE_SIGNAL_RR = "IMP_TORQUE_RR"  # 右后轮扭矩信号
+class PythonCarsimEnv:
+    """
+    CarSim Python 直连
+    """
     
-    # 车辆状态信号名称常量
-    LONGITUDINAL_SPEED = "Vx"  # 纵向速度信号
-    LONGITUDINAL_ACCEL = "Ax"  # 纵向加速度信号
-    SLIP_FL = "SLIP_FL"  # 左前轮滑移率
-    SLIP_FR = "SLIP_FR"  # 右前轮滑移率
-    SLIP_RL = "SLIP_RL"  # 左后轮滑移率
-    SLIP_RR = "SLIP_RR"  # 右后轮滑移率
-    YAW_RATE = "Yaw"  # 横摆角速度信号
+    # ================= CarSim 变量名配置 =================
+    # 1. 控制信号 (对应 CarSim Generic Import)
+    IMP_THROTTLE = "IMP_THROTTLE_ENGINE" # 油门 (0-1)
+    IMP_BRAKE = "IMP_PCON_BK"        # 制动压力 (MPa)
     
+    # 4轮驱动扭矩 (Nm) - 你的控制目标
+    IMP_TORQUE_L1 = "IMP_MY_OUT_D1_L" 
+    IMP_TORQUE_R1 = "IMP_MY_OUT_D1_R" 
+    IMP_TORQUE_L2 = "IMP_MY_OUT_D2_L" 
+    IMP_TORQUE_R2 = "IMP_MY_OUT_D2_R" 
+
+    # 2. 状态信号 (对应 CarSim Generic Export)
+    EXP_VX = "Vx"         # 纵向车速 (km/h)
+    EXP_AX = "Ax"         # 纵向加速度 (g, 需注意单位转换)
+    EXP_AVZ = "AVz"       # 横摆角速度 (deg/s)
+    
+    # 轮速 (RPM) - 用于计算滑移率
+    EXP_WHEEL_L1 = "AVy_L1"
+    EXP_WHEEL_R1 = "AVy_R1"
+    EXP_WHEEL_L2 = "AVy_L2"
+    EXP_WHEEL_R2 = "AVy_R2"
+
+    # ====================================================
+
     def __init__(
         self,
         carsim_db_dir: str,
-        sim_time_s: float = 20.0,
+        vehicle_type: str = "normal_vehicle", # 对应 pycarsimlib 配置的 key
+        sim_time_s: float = 10.0,
         delta_time_s: float = 0.01,
         max_torque: float = 1500.0,
-        target_slip_ratio: float = 0.1, 
+        target_slip_ratio: float = 0.15,
         target_speed: float = 100.0,
-        vehicle_type: str = "normal_vehicle",
         reward_weights: dict = None
     ):
         self.carsim_db_dir = carsim_db_dir
+        self.vehicle_type = vehicle_type
         self.sim_time_s = sim_time_s
         self.delta_time = timedelta(seconds=delta_time_s)
         self.max_steps = int(sim_time_s / delta_time_s)
+        
         self.max_torque = max_torque
         self.target_slip_ratio = target_slip_ratio
         self.target_speed = target_speed
-        self.vehicle_type = vehicle_type
         
-        # 默认权重配置
+        # 奖励权重
         default_weights = {
-            'w_speed': 0.15,      # 速度奖励
-            'w_accel': 2.0,       # 加速度奖励
-            'w_energy': -0.0,     # 能耗
-            'w_consistency': -0.0,# 一致性
-            'w_yaw': -0.0,        # 横摆
-            'w_slip': -0.1,       # 滑移率
-            'w_smooth': -0.0      # 平滑
+            'w_speed': 0.1, 'w_accel': 0.0, 'w_energy': 0.0,
+            'w_consistency': 0.0, 'w_beta': 0.0, 'w_slip': -1.0, 'w_smooth': 0.0
         }
         self.weights = default_weights.copy()
         if reward_weights:
             self.weights.update(reward_weights)
             
-        # 运行时变量
-        self.cm: Optional[CarsimManager] = None  # CarSim管理器实例
-        self.runtime: float = 0.0  # 当前回合已运行时间
+        # 物理常数
+        self.wheel_radius = 0.362 # m (需根据车型修改)
+        self.veh_bf = 1.600; # 前轮距 m
+        self.veh_br = 1.740; # 后轮距 m
+
+        # 内部变量
+        self.cm: Optional[CarsimManager] = None
+        self.current_step = 0
         self.last_torque = np.zeros(4)
-        self.filter_alpha = 0.6 
         
-        # 状态维度现在是 7
-        # 顺序: [Vx, Ax, S_FL, S_FR, S_RL, S_RR, Yaw]
-        self.state_dim = 7 
+        # 维度: [Vx, Ax, S_L1, S_R1, S_L2, S_R2, YawRate]
+        self.state_dim = 7
         self.action_dim = 4
-        self.current_step = 0
 
-    def reset(self) -> np.ndarray:
-        """重置环境并返回初始状态"""
-        # 如果存在CarSim管理器实例，先关闭它
-        if self.cm:
-            self.cm.close()
-            self.cm = None
+    def reset(self) -> Tuple[np.ndarray, Dict]:
+        """
+        重启仿真环境
+        """
+        # 1. 关闭旧的 Solver
+        self.close()
         
-        # 初始化CarSim管理器并启动仿真
-        self.cm = CarsimManager(
-            database_dir=self.carsim_db_dir,
-            vehicle_type=self.vehicle_type,
-            output_file_name="sim_output",
-            delta_time=self.delta_time
-        )
-        
-        # 初始化回合变量
+        # 2. 实例化新的 Manager (相当于点击 Run)
+        # 注意: 这里会加载 DLL 并初始化
+        try:
+            self.cm = CarsimManager(
+                carsim_db_dir=self.carsim_db_dir,
+                vehicle_type=self.vehicle_type
+            )
+        except Exception as e:
+            raise RuntimeError(f"无法启动 CarSim Solver, 请检查路径和License: {e}")
+
         self.current_step = 0
-        self.runtime = 0.0
         self.last_torque = np.zeros(4)
         
-        # 获取初始状态
-        state_raw = self._receive_state_raw()
-        return np.array(state_raw)
-
-    def step(self, action) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-        """执行动作并返回新状态、奖励、是否结束和额外信息"""
-        # 将动作映射到实际扭矩值
-        target_torque = action * self.max_torque
-        real_torque = target_torque
+        # 3. 运行第 0 步 (初始化状态)
+        init_action = self._get_zero_action_dict()
+        obs, _, _ = self.cm.step(action=init_action, delta_time=self.delta_time)
         
-        # 创建动作字典，格式与CarsimManager兼容
-        action_dict = {
-            self.TORQUE_SIGNAL_FL: real_torque[0],
-            self.TORQUE_SIGNAL_FR: real_torque[1],
-            self.TORQUE_SIGNAL_RL: real_torque[2],
-            self.TORQUE_SIGNAL_RR: real_torque[3],
-            self.STEERING_SIGNAL: 0.0,  # 默认方向盘转角为0
-            self.BRAKE_SIGNAL: 0.0,     # 默认制动压力为0
-            self.THROTTLE_SIGNAL: 1.0   # 默认油门为1.0
+        # 4. 解析状态
+        state = self._parse_observation(obs)
+        norm_state = self._normalize_state(state)
+        
+        return norm_state, {}
+
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
+        """
+        执行一步 RL
+        """
+        # 1. 动作处理 (Agent输出 [0, 1] -> 物理扭矩)
+        action = np.clip(action, 0.0, 1.0)
+        target_torque = action * self.max_torque
+        
+        # 2. 构造 CarSim 输入字典
+        control_inputs = {
+            self.IMP_THROTTLE: 1.0,      # 不踩油门踏板，直接控扭矩
+            self.IMP_BRAKE: 0.0,
+            
+            # 4轮扭矩
+            self.IMP_TORQUE_L1: target_torque[0],
+            self.IMP_TORQUE_R1: target_torque[1],
+            self.IMP_TORQUE_L2: target_torque[2],
+            self.IMP_TORQUE_R2: target_torque[3],
         }
         
-        # 执行仿真步
-        observations = self.cm.step(action_dict, self.delta_time)
+        # 3. 物理仿真一步
+        # CarsimManager.step 返回: (observation_dict, terminated, time_sec)
+        obs, terminated, _ = self.cm.step(action=control_inputs, delta_time=self.delta_time)
         
-        # 获取原始状态
-        raw_state = self._receive_state_raw()
+        # 4. 状态解析与计算
+        raw_state = self._parse_observation(obs)
         next_state = self._normalize_state(raw_state)
         
-        # 计算奖励
-        reward, reward_details = self._calculate_reward(raw_state, real_torque, self.last_torque)
+        # 5. 奖励计算
+        reward, r_details = self._calculate_reward(raw_state, target_torque, self.last_torque)
         
-        # 更新回合变量
-        self.last_torque = real_torque
+        self.last_torque = target_torque
         self.current_step += 1
-        self.runtime += self.delta_time.total_seconds()
-
-        # 打印进度信息
-        details_str = " | ".join([f"{k}: {v:.3f}" for k, v in reward_details.items()])
-        if self.current_step % 100 == 0:
-            print(f"step: {self.current_step}, reward: {reward:.4f}, vx: {raw_state[0]:.2f} km/h || {details_str}")
-
-        # 检查是否结束
-        done = self.current_step >= self.max_steps
+        slip_error = np.mean(np.abs(raw_state[2:6] - self.target_slip_ratio))
         
-        # 构造额外信息字典
+        # 6. 结束判定
+        done = (self.current_step >= self.max_steps) or terminated
+        
+        # 7. 构造 Info (用于 TensorBoard)
         info = {
-            "slip_error": np.mean(np.abs(raw_state[2:6] - self.target_slip_ratio)), 
-            "vx": raw_state[0], 
-            "ax": raw_state[1], 
-            **reward_details
+            "vx": raw_state[0],
+            "slip_error": slip_error,
+            **r_details
         }
         
+        # 打印 (同行刷新)
+        if self.current_step % 10 == 0:
+            dtl_str = " | ".join([f"{k}: {v:.2f}" for k, v in r_details.items()])
+            print(f"\rStep: {self.current_step} | Rw: {reward:.4f} | Vx: {raw_state[0]:.1f} | SlipErr: {slip_error:.2f}|| {dtl_str}", end="", flush=True)
+        
+        if done: print() # 换行
+            
         return next_state, reward, done, info
 
-    def _receive_state_raw(self) -> np.ndarray:
-        """
-        直接从CarSimManager获取状态数据
-        顺序: Vx, Ax, S_FL, S_FR, S_RL, S_RR, Yaw
-        """
-        # 从最新的观测值字典中提取状态
-        if self.cm.observations:
-            obs = self.cm.observations
-            return np.array([
-                obs.get(self.LONGITUDINAL_SPEED, 0.0),  # Vx (km/h)
-                obs.get(self.LONGITUDINAL_ACCEL, 0.0),  # Ax (m/s^2)
-                obs.get(self.SLIP_FL, 0.0) * 100,        # S_FL (%，转换为百分比)
-                obs.get(self.SLIP_FR, 0.0) * 100,        # S_FR (%，转换为百分比)
-                obs.get(self.SLIP_RL, 0.0) * 100,        # S_RL (%，转换为百分比)
-                obs.get(self.SLIP_RR, 0.0) * 100,        # S_RR (%，转换为百分比)
-                obs.get(self.YAW_RATE, 0.0)              # Yaw (deg)
-            ], dtype=np.float32)
-        else:
-            return np.zeros(self.state_dim, dtype=np.float32)
-
-    def _normalize_state(self, raw_state):
-        """
-        [修改] 针对 7维数据进行归一化
-        raw_state: [Vx, Ax, S1, S2, S3, S4, Yaw]
-        """
-        norm_state = raw_state.copy()
-        
-        # 1. 速度 Vx (索引0) -> /100
-        norm_state[0] = raw_state[0] / 100.0 
-        
-        # 2. 加速度 Ax (索引1) -> /5.0 (归一化到 -1~1 范围)
-        norm_state[1] = raw_state[1] / 1.0    
-        
-        # 3. 滑移率 Slips (索引2-5) ->
-        norm_state[2:6] = raw_state[2:6]/100
-        
-        # 4. 横摆角速度 Yaw (索引6) -> /50.0
-        norm_state[6] = raw_state[6] / 10.0   
-        
-        return norm_state
-
-    def _calculate_reward(self, state, current_torque, last_torque):
-        if np.all(state == 0): return 0.0, {}
-        
-        # [修改] 基于新索引提取物理量
-        vx = state[0]           # km/h
-        ax = state[1]           # m/s^2
-        slip = state[2:6] # 假设 Simulink 发来的是 %, 否则去掉 *0.01
-        beta = state[6]     # deg偏航角
-        
-        w = self.weights 
-        
-        # 1. Speed
-        r_speed = w['w_speed'] * (vx) 
-        
-        # 2. Accel
-        if ax > 0.0:
-            r_accel = w['w_accel'] * (ax)
-        else:
-            r_accel = 0.0
-        
-        # 3. Energy
-        torque_norm = current_torque / self.max_torque
-        r_energy = w['w_energy'] * np.sum(np.square(torque_norm))
-        
-        # 4. Slip (前后轮分离)
-        # 提取前后轮滑移率
-        slip_FL = slip[0] # FL
-        slip_FR = slip[1] # FR
-        slip_RL = slip[2] # RL
-        slip_RR = slip[3] # RR
-        
-        # 设定阈值
-        threshold_front = 0.10  # 前轮 10%
-        threshold_rear  = 0.15  # 后轮 15%
-        
-        # 计算超出的部分 (小于阈值则为0)
-        excess_FL = np.maximum(0.0, slip_FL - threshold_front)
-        excess_FR = np.maximum(0.0, slip_FR - threshold_front)
-        excess_RL = np.maximum(0.0, slip_RL - threshold_rear)
-        excess_RR = np.maximum(0.0, slip_RR - threshold_rear)
-        
-        if vx > 3: # 只有车动起来才算滑移惩罚
-            r_slip_FL = w['w_slip'] * excess_FL
-            r_slip_FR = w['w_slip'] * excess_FR
-            r_slip_RL = w['w_slip'] * excess_RL
-            r_slip_RR = w['w_slip'] * excess_RR
-            
-            # 总滑移奖励
-            r_slip = r_slip_FL + r_slip_FR + r_slip_RL + r_slip_RR
-        else:
-            r_slip = 0.0
-
-        # 5. Consistency
-        diff_front = abs(current_torque[0] - current_torque[1])
-        diff_rear = abs(current_torque[2] - current_torque[3])
-        r_consistency = w['w_consistency'] * ((diff_front + diff_rear) / self.max_torque)
-        
-        # 6. Smooth
-        delta_torque = (current_torque - last_torque) / self.max_torque
-        smooth_l2 = np.mean(np.square(delta_torque))
-        r_smooth = w['w_smooth'] * smooth_l2 * 10.0
-
-        # 7. Yaw
-        r_beta = w['w_beta'] * abs(beta)
-
-        total_reward = r_speed + r_accel + r_energy + r_consistency + r_slip + r_smooth + r_beta
-
-        reward_details = {
-            "R_Speed": r_speed,
-            "R_Accel": r_accel,
-            "R_Energy": r_energy,
-            "R_Consis": r_consistency,
-            "R_Slip": r_slip,
-            "R_Smooth": r_smooth,
-            "R_Beta": r_beta
-        }
-
-        return total_reward, reward_details
-    
-    # [修改] 维度更新
-    def get_state_dim(self): return 7 
-    def get_action_dim(self): return 4
-    def close(self) -> None:
-        """关闭环境资源"""
+    def close(self):
         if self.cm:
             self.cm.close()
             self.cm = None
+
+    # ================= 辅助函数 =================
+    
+    def _get_zero_action_dict(self):
+        return {
+            self.IMP_THROTTLE: 0.0, self.IMP_BRAKE: 0.0,
+            self.IMP_TORQUE_L1: 0.0, self.IMP_TORQUE_R1: 0.0,
+            self.IMP_TORQUE_L2: 0.0, self.IMP_TORQUE_R2: 0.0
+        }
+
+    def _parse_observation(self, obs: Dict[str, float]) -> np.ndarray:
+        """从字典解析物理值并计算滑移率"""
+        vx = obs.get(self.EXP_VX, 0.0) # km/h
+        ax = obs.get(self.EXP_AX, 0.0) # g? 假设 CarSim 输出是 g
+        avz = obs.get(self.EXP_AVZ, 0.0) * np.pi / 180
+        
+        # 轮速 RPM -> 线速度 m/s
+        rpm_to_ms = (2 * np.pi / 60.0) * self.wheel_radius
+        v_L1 = obs.get(self.EXP_WHEEL_L1, 0.0) * rpm_to_ms
+        v_R1 = obs.get(self.EXP_WHEEL_R1, 0.0) * rpm_to_ms
+        v_L2 = obs.get(self.EXP_WHEEL_L2, 0.0) * rpm_to_ms
+        v_R2 = obs.get(self.EXP_WHEEL_R2, 0.0) * rpm_to_ms
+        
+        # 计算滑移率 S = (V_wheel - Vx) / max(Vx, 1.0)
+        v_L1_c = vx/3.6 - self.veh_bf * avz #轮心速度
+        v_R1_c = vx/3.6 + self.veh_bf * avz 
+        v_L2_c = vx/3.6 - self.veh_br * avz 
+        v_R2_c = vx/3.6 + self.veh_br * avz 
+
+        vx_ms = vx / 3.6
+        denom = max(abs(vx_ms), 1.0)
+        
+        s_L1 = (v_L1 - v_L1_c) / denom
+        s_R1 = (v_R1 - v_R1_c) / denom
+        s_L2 = (v_L2 - v_L2_c) / denom
+        s_R2 = (v_R2 - v_R2_c) / denom
+        print(s_L1, s_R1, s_L2, s_R2)
+        # Ax 单位转换
+        ax_ms2 = ax 
+
+        return np.array([vx, ax_ms2, s_L1, s_R1, s_L2, s_R2, avz], dtype=np.float32)
+
+    def _normalize_state(self, raw_state):
+        # 简单的归一化，方便神经网络吃
+        n_s = raw_state.copy()
+        n_s[0] = raw_state[0] / 100.0  # Vx
+        n_s[1] = raw_state[1] / 1.0    # Ax
+        n_s[2:6] = raw_state[2:6] / 1  # Slips
+        n_s[6] = raw_state[6] / 50.0   # Avz
+        return n_s
+
+    def _calculate_reward(self, state, current_torque, last_torque):
+        # 解包状态
+        vx = state[0]
+        # ax = state[1]
+        slips = state[2:6]
+        # avz = state[6]
+        
+        w = self.weights
+        
+        # 1. Speed 奖励
+        r_speed = w['w_speed'] * vx
+        
+        # 2. Slip 惩罚 (核心)
+        # 阈值：前轮 15%, 后轮 20%
+        excess = 0.0
+        thresholds = [0.15, 0.15, 0.20, 0.20]
+        for i in range(4):
+            excess += max(0.0, abs(slips[i]) - thresholds[i])
+            
+        r_slip = 0.0
+        if vx > 5.0: # 车动起来再算
+            r_slip = w['w_slip'] * excess * 10.0 # 放大惩罚
+            
+        # 3. Energy
+        r_energy = w['w_energy'] * np.mean((current_torque/self.max_torque)**2)
+        
+        # 4. Consistency & Smooth
+        r_smooth = w['w_smooth'] * np.mean(((current_torque - last_torque)/self.max_torque)**2)
+        
+        total = r_speed + r_slip + r_energy + r_smooth
+        details = {"R_Spd": r_speed, "R_Slp": r_slip, "R_Eng": r_energy}
+        
+        return total, details
+
+    def get_state_dim(self): return self.state_dim
+    def get_action_dim(self): return self.action_dim
