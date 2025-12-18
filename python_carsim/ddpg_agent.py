@@ -54,7 +54,7 @@ class DDPGAgent:
         tau: float = 5e-3,
         actor_lr: float = 1e-4,
         critic_lr: float = 1e-3,
-        buffer_capacity: int = 10000,
+        buffer_capacity: int = 100000,
         batch_size: int = 128,
         device: str = None,
         # 精英回放参数

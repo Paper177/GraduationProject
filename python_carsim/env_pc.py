@@ -119,7 +119,7 @@ class PythonCarsimEnv:
         
         # 2. 构造 CarSim 输入字典
         control_inputs = {
-            self.IMP_THROTTLE: 1.0,      # 不踩油门踏板，直接控扭矩
+            self.IMP_THROTTLE: 0.0,      # 不踩油门踏板，直接控扭矩
             self.IMP_BRAKE: 0.0,
             
             # 4轮扭矩
@@ -147,17 +147,38 @@ class PythonCarsimEnv:
         # 6. 结束判定
         done = (self.current_step >= self.max_steps) or terminated
         
-        # 7. 构造 Info (用于 TensorBoard)
+        # 7. 构造详细 Info (用于看板显示)
+        # raw_state 索引: 0:Vx, 1:Ax, 2:SL1, 3:SR1, 4:SL2, 5:SR2, 6:Yaw
         info = {
-            "vx": raw_state[0],
-            "slip_error": slip_error,
+            # --- 车辆状态 ---
+            "vx": raw_state[0],       # km/h
+            "ax": raw_state[1],       # g
+            "yaw": raw_state[6],      # deg/s
+            
+            # --- 滑移率 (原始值) ---
+            "slip_L1": raw_state[2],
+            "slip_R1": raw_state[3],
+            "slip_L2": raw_state[4],
+            "slip_R2": raw_state[5],
+            
+            # --- 动作 (扭矩 Nm) ---
+            "trq_L1": target_torque[0],
+            "trq_R1": target_torque[1],
+            "trq_L2": target_torque[2],
+            "trq_R2": target_torque[3],
+            
+            # --- 奖励细节 ---
             **r_details
         }
+        # ================= [修改结束] =================
+        
+        # 注释掉原来的简单 print，交给外部看板处理
+        # if self.current_step % 10 == 0: ...
         
         # 打印 (同行刷新)
-        if self.current_step % 10 == 0:
-            dtl_str = " | ".join([f"{k}: {v:.2f}" for k, v in r_details.items()])
-            print(f"\rStep: {self.current_step} | Rw: {reward:.4f} | Vx: {raw_state[0]:.1f} | SlipErr: {slip_error:.2f}|| {dtl_str}", end="", flush=True)
+        #if self.current_step % 10 == 0:
+            #dtl_str = " | ".join([f"{k}: {v:.2f}" for k, v in r_details.items()])
+            #print(f"\rStep: {self.current_step} | Rw: {reward:.4f} | Vx: {raw_state[0]:.1f} | SlipErr: {slip_error:.2f}|| {dtl_str}", end="", flush=True)
         
         if done: print() # 换行
             
@@ -191,23 +212,18 @@ class PythonCarsimEnv:
         v_R2 = obs.get(self.EXP_WHEEL_R2, 0.0) * rpm_to_ms
         
         # 计算滑移率 S = (V_wheel - Vx) / max(Vx, 1.0)
-        v_L1_c = vx/3.6 - self.veh_bf * avz #轮心速度
-        v_R1_c = vx/3.6 + self.veh_bf * avz 
-        v_L2_c = vx/3.6 - self.veh_br * avz 
-        v_R2_c = vx/3.6 + self.veh_br * avz 
-
-        vx_ms = vx / 3.6
-        denom = max(abs(vx_ms), 1.0)
+        v_L1_c = vx/3.6  #轮心速度
+        v_R1_c = vx/3.6  
+        v_L2_c = vx/3.6  
+        v_R2_c = vx/3.6 
         
-        s_L1 = (v_L1 - v_L1_c) / denom
-        s_R1 = (v_R1 - v_R1_c) / denom
-        s_L2 = (v_L2 - v_L2_c) / denom
-        s_R2 = (v_R2 - v_R2_c) / denom
-        print(s_L1, s_R1, s_L2, s_R2)
-        # Ax 单位转换
-        ax_ms2 = ax 
+        s_L1 = (v_L1 - v_L1_c) / max(abs(v_L1), abs(v_L1_c)) if abs(vx) > 3.0 else 0.0
+        s_R1 = (v_R1 - v_R1_c) / max(abs(v_R1), abs(v_R1_c)) if abs(vx) > 3.0 else 0.0
+        s_L2 = (v_L2 - v_L2_c) / max(abs(v_L2), abs(v_L2_c)) if abs(vx) > 3.0 else 0.0
+        s_R2 = (v_R2 - v_R2_c) / max(abs(v_R2), abs(v_R2_c)) if abs(vx) > 3.0 else 0.0
+        
 
-        return np.array([vx, ax_ms2, s_L1, s_R1, s_L2, s_R2, avz], dtype=np.float32)
+        return np.array([vx, ax, s_L1, s_R1, s_L2, s_R2, avz], dtype=np.float32)
 
     def _normalize_state(self, raw_state):
         # 简单的归一化，方便神经网络吃
@@ -221,7 +237,7 @@ class PythonCarsimEnv:
     def _calculate_reward(self, state, current_torque, last_torque):
         # 解包状态
         vx = state[0]
-        # ax = state[1]
+        ax = state[1]
         slips = state[2:6]
         # avz = state[6]
         
@@ -229,26 +245,27 @@ class PythonCarsimEnv:
         
         # 1. Speed 奖励
         r_speed = w['w_speed'] * vx
+        # 2. Acceleration 奖励
+        r_accel = w['w_accel'] * ax
         
         # 2. Slip 惩罚 (核心)
-        # 阈值：前轮 15%, 后轮 20%
         excess = 0.0
-        thresholds = [0.15, 0.15, 0.20, 0.20]
+        thresholds = [0.04, 0.04, 0.06, 0.06]
         for i in range(4):
             excess += max(0.0, abs(slips[i]) - thresholds[i])
             
         r_slip = 0.0
-        if vx > 5.0: # 车动起来再算
-            r_slip = w['w_slip'] * excess * 10.0 # 放大惩罚
+        if vx > 3.0: # 车动起来再算
+            r_slip = w['w_slip'] * excess # 放大惩罚
             
         # 3. Energy
-        r_energy = w['w_energy'] * np.mean((current_torque/self.max_torque)**2)
+        r_energy = w['w_energy'] * np.mean((current_torque/self.max_torque))
         
         # 4. Consistency & Smooth
         r_smooth = w['w_smooth'] * np.mean(((current_torque - last_torque)/self.max_torque)**2)
         
-        total = r_speed + r_slip + r_energy + r_smooth
-        details = {"R_Spd": r_speed, "R_Slp": r_slip, "R_Eng": r_energy}
+        total = r_speed + r_accel + r_slip + r_energy + r_smooth
+        details = {"R_Spd": r_speed, "R_Acc": r_accel, "R_Slp": r_slip, "R_Eng": r_energy}
         
         return total, details
 
