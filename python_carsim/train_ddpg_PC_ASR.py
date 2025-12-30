@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 DDPG-PC Training Script
-Python-CarSim DLL Link
+Direct Python-CarSim DLL Link
 """
 import numpy as np
 import torch
@@ -10,6 +10,7 @@ import os
 import random
 import io
 import matplotlib
+# 使用非交互式后端Agg来避免Tcl_AsyncDelete错误
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -17,18 +18,17 @@ import torchvision.transforms as transforms
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 from dashboard import create_live_monitor
-from ddpg_agent import DDPGAgent
-from env_pc import PythonCarsimEnv 
-import gc
 
-#================= 绘图与日志 =================
+# 请确保这些文件在同一目录下
+from ddpg_agent import DDPGAgent
+from env_pc_ASR import PythonCarsimEnv 
+
+# ================= 绘图与日志功能 =================
+
 def log_episode_visuals(writer, episode_num, history, save_dir=None):
     """
     绘制本回合的详细曲线并上传到 TensorBoard，同时保存到本地
     """
-    # 显式清理内存，防止长时间运行导致内存泄漏
-    plt.close('all')
-    gc.collect()
     # 创建一个 2x2 的画布
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     fig.suptitle(f'Detailed Analysis', fontsize=16)
@@ -102,7 +102,6 @@ def log_episode_visuals(writer, episode_num, history, save_dir=None):
         
     plt.close(fig)
 
-#================= 固定训练种子 =================
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -111,7 +110,6 @@ def setup_seed(seed):
     torch.backends.cudnn.deterministic = True
     print(f"随机种子已锁定为: {seed}")
 
-#================= 训练主函数 =================
 def train_ddpg_PC(
     max_episodes: int = 10000,
     max_torque: float = 1500.0,
@@ -119,14 +117,14 @@ def train_ddpg_PC(
     log_dir: str = "logs_PC",
     pretrained_model_path: str = None 
 ):
-    # --- 配置 ---
+    # --- 1. 配置 ---
     reward_weights = {
         'w_speed': 0.00,
-        'w_accel': 0.06,
-        'w_energy': 0.015,
-        'w_consistency': -0.025,
+        'w_accel': 0.0,
+        'w_energy': 1.2,
+        'w_consistency': 0,
         'w_beta': -0.0,
-        'w_slip': -0.35,
+        'w_slip': -3.5,
         'w_smooth': -0.0
     }
     
@@ -135,16 +133,15 @@ def train_ddpg_PC(
         'Hidden Dim': 256,
         'Actor LR': 1e-5,      
         'Critic LR': 1e-4,
-        'Buffer Capacity': 1000000,
-        'Batch Size': 1024,
-        'Elite Ratio': 0.4,    
-        'Elite Capacity': 200000,
+        'Batch Size': 512,
+        'Elite Ratio': 0.3,    
+        'Elite Capacity': 20000,
         'Noise Scale': 0.5,    
         'Min Noise': 0.05,
         'Noise Decay': 0.998,  
     }
     
-    # --- 日志初始化 ---
+    # 日志初始化
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(log_dir, f"Python_Carsim_{current_time}")
     os.makedirs(log_path, exist_ok=True)
@@ -162,7 +159,7 @@ def train_ddpg_PC(
         print(f"[Info] 已备份 train_ddpg_PC.py 和 env_pc.py 到 {log_path}")
     except Exception as e:
         print(f"[Warning] 备份文件失败: {e}")
-    # --- Tensorboard存储参数 ---
+    # -----------------------------
     
     md_table = "### Reward Coefficients\n| Key | Value |\n|---|---|\n"
     for k, v in reward_weights.items():
@@ -176,17 +173,18 @@ def train_ddpg_PC(
 
     print(f"训练日志: {log_path}")
 
-    # --- 环境初始化 ---
+    # --- 2. 初始化环境 ---
+    # [请修改] 你的 CarSim 数据库路径
     CARSIM_DB_DIR = r"E:\CarSim2022\CarSim2022.1_Prog\RL" 
     
     if not os.path.exists(CARSIM_DB_DIR):
-        print(f"找不到 CarSim 数据库路径: {CARSIM_DB_DIR}")
+        print(f"❌ 错误: 找不到 CarSim 数据库路径: {CARSIM_DB_DIR}")
         return
 
     env = PythonCarsimEnv(
         carsim_db_dir=CARSIM_DB_DIR,
         sim_time_s=10.0,       
-        delta_time_s=0.01,
+        delta_time_s=0.001,
         max_torque=max_torque,
         target_slip_ratio=target_slip_ratio,
         target_speed=100,
@@ -194,7 +192,7 @@ def train_ddpg_PC(
         reward_weights=reward_weights
     )
     
-    # --- DDPG初始化 ---
+    # --- 3. 初始化 Agent ---
     agent = DDPGAgent(
         state_dim=env.get_state_dim(),
         action_dim=env.get_action_dim(),
@@ -202,18 +200,18 @@ def train_ddpg_PC(
         hidden_dim=hyperparams['Hidden Dim'],
         actor_lr=hyperparams['Actor LR'],
         critic_lr=hyperparams['Critic LR'],
-        buffer_capacity=hyperparams['Buffer Capacity'],
         batch_size=hyperparams['Batch Size'],
         elite_ratio=hyperparams['Elite Ratio'],
         elite_capacity=hyperparams['Elite Capacity']   
     )
-    # --- 加载预训练模型 ---
+    
+    # 加载预训练
     if pretrained_model_path and os.path.exists(pretrained_model_path):
-        print(f"加载预训练模型: {pretrained_model_path}")
+        print(f"🔄 加载预训练模型: {pretrained_model_path}")
         agent.load_model(pretrained_model_path)
-        noise_scale = 0.1 
+        noise_scale = 0.15 
     else:
-        print("从零开始训练")
+        print("🆕 从零开始训练")
         noise_scale = hyperparams['Noise Scale']
 
     best_episode_reward = -float('inf') 
@@ -226,14 +224,16 @@ def train_ddpg_PC(
     try:
         with live_display:
             for episode in range(max_episodes):
-                # Reset
+                # 1. Reset
                 state, info = env.reset()
                 agent.reset_noise() 
                 episode_reward = 0
 
-                # 数据容器
+                # 统计数据容器
                 reward_stats = {} 
                 current_episode_memory = []
+                
+                # [关键] 绘图数据容器 (Key 需要与 log_episode_visuals 对应)
                 episode_visual_history = {
                     'T_L1': [], 'T_R1': [], 'T_L2': [], 'T_R2': [],
                     'S_L1': [], 'S_R1': [], 'S_L2': [], 'S_R2': [],
@@ -241,61 +241,54 @@ def train_ddpg_PC(
                     'r_total': [], 
                     'target_slip': []
                 }
+                
                 critic_grads = []
                 actor_grads = []
                 is_elite_display = False
                 final_info = {}
                 
                 while True:
-                    # Select Action
+                    # 2. Select Action
                     action = agent.select_action(state, noise_scale=noise_scale)
 
-                    # Step
+                    # 3. Step
                     next_state, reward, done, info = env.step(action)
                     final_info = info
                     
-                    # --- 收集绘图数据 ---
+                    # === [收集绘图数据 - 适配 env_pc.py] ===
                     
-                    # 扭矩 (从 info 中获取 env 实际施加的扭矩)
+                    # 记录扭矩 (从 info 中获取 env 实际施加的扭矩，或者用 action * max)
+                    # env_pc.py 的 info 中有 'trq_L1' 等
                     episode_visual_history['T_L1'].append(info.get('trq_L1', 0))
                     episode_visual_history['T_R1'].append(info.get('trq_R1', 0))
                     episode_visual_history['T_L2'].append(info.get('trq_L2', 0))
                     episode_visual_history['T_R2'].append(info.get('trq_R2', 0))
                     
-                    # 滑移率 (对应 env_pc.py 的 keys: slip_L1, slip_R1...)
+                    # 记录滑移率 (对应 env_pc.py 的 keys: slip_L1, slip_R1...)
                     episode_visual_history['S_L1'].append(info.get('slip_L1', 0))
                     episode_visual_history['S_R1'].append(info.get('slip_R1', 0))
                     episode_visual_history['S_L2'].append(info.get('slip_L2', 0))
                     episode_visual_history['S_R2'].append(info.get('slip_R2', 0))
                     episode_visual_history['target_slip'].append(target_slip_ratio)
                     
-                    # 速度
+                    # 记录速度
                     episode_visual_history['velocity'].append(info.get('vx', 0))
                     
-                    # 总奖励
+                    # 记录总奖励
                     episode_visual_history['r_total'].append(reward)
                     
                     # 动态记录奖励分项 (R_Spd, R_Slp, R_Eng)
                     for k, v in info.items():
                         if k.startswith("R_"):
+                            # 1. 用于 Sum 统计
                             if k not in reward_stats: reward_stats[k] = []
                             reward_stats[k].append(v)
+                            # 2. 用于 绘图
                             if k not in episode_visual_history: episode_visual_history[k] = []
                             episode_visual_history[k].append(v)
+                    # ========================================
 
-                    # ============================== =========
-
-                    # --- 末速度奖励 ---
-                    if done:
-                        final_v = info.get('vx', 0.0)
-                        r_terminal = final_v * 0.2 
-                        reward += r_terminal
-                        if 'R_Terminal' not in reward_stats: reward_stats['R_Terminal'] = []
-                        reward_stats['R_Terminal'].append(r_terminal)
-                        episode_visual_history['r_total'][-1] = reward
-                    # -------------------------
-
-                    # Push & Train
+                    # 4. Push & Train
                     agent.push(state, action, reward, next_state, done)
                     current_episode_memory.append((state, action, reward, next_state, done))
                     
@@ -310,29 +303,31 @@ def train_ddpg_PC(
                     episode_reward += reward
                     
                     # 实时更新看板
-                    if env.current_step % 10 == 0 or done:
-                        dashboard.update(
-                            episode=episode+1,
-                            step=env.current_step,
-                            info=info,
-                            reward=reward,
-                            noise=noise_scale,
-                            elite_flag=is_elite_display
-                        )
+                    dashboard.update(
+                        episode=episode+1,
+                        step=env.current_step,
+                        info=info,
+                        reward=reward,
+                        noise=noise_scale,
+                        elite_flag=is_elite_display
+                    )
+                    live_display.refresh() # 强制刷新，确保每一步都能看到变化
                     
                     if done: break
                 
                 # --- Episode End ---
                 
-                # 绘图每10回合画一次
+                # [绘图触发] 每10回合画一次
                 if (episode) % 10 == 0:
                     log_episode_visuals(writer, episode, episode_visual_history, save_dir=log_path)
                 
-                # Tensorboard记录处理
+                # Summary stats
                 sum_rewards = {k: np.sum(v) for k, v in reward_stats.items()}
                 avg_c = np.mean(critic_grads) if critic_grads else 0
                 avg_a = np.mean(actor_grads) if actor_grads else 0
                 final_speed = final_info.get('vx', 0.0)
+
+                # Tensorboard Scalars
                 writer.add_scalar('Loss/Critic', c_loss, episode)
                 writer.add_scalar('Loss/Actor', a_loss, episode)
                 writer.add_scalar('Train/Reward', episode_reward, episode)
@@ -353,21 +348,21 @@ def train_ddpg_PC(
                 if episode_reward > best_episode_reward*0.9 and episode_reward >=0:
                     is_elite_display = True
                     writer.add_scalar('Train/Is_Elite', 1, episode)
-                    dashboard.log(f"[精英]! Reward: {episode_reward:.1f}")
+                    dashboard.log(f"🌟 [精英]! Reward: {episode_reward:.1f}")
                     for trans in current_episode_memory:
                         agent.push_elite(*trans)
                     if episode_reward > best_episode_reward:
                         best_episode_reward = episode_reward
                         agent.save_model(os.path.join("best_model_save", f"Python_Carsim_{current_time}_{episode}_{best_episode_reward}.pt"))
                         log_episode_visuals(writer, episode, episode_visual_history, save_dir=log_path)
-                        dashboard.log(f"[新纪录] ! Reward: {episode_reward:.1f}")
+                        dashboard.log(f"🌟 [新纪录] ! Reward: {episode_reward:.1f}")
                 else:
                     writer.add_scalar('Train/Is_Elite', 0, episode)
                     noise_scale = max(min_noise, noise_scale * noise_decay)
                 
 
     except KeyboardInterrupt:
-        print("=====停止训练=====")
+        print("人为停止训练...")
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -382,5 +377,5 @@ if __name__ == "__main__":
     setup_seed(42)
     train_ddpg_PC(
         #pretrained_model_path="best_model_save/Python_Carsim_20251223_173827_482_252.94361713080013.pt"
-        #pretrained_model_path="best_model_save/Python_Carsim_20251217_144021.pt"
+        pretrained_model_path="best_model_save/Python_Carsim_20251217_144021.pt"
     )

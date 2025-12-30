@@ -53,6 +53,7 @@ class TrainingDashboard:
             "Episode": episode,
             "Step": step,
             "Speed (km/h)": info.get('vx', 0),
+            "Ref Speed": info.get('ref_vx', 0),
             "Accel (g)": info.get('ax', 0),
             "Yaw Rate": info.get('yaw', 0),
             "Step Reward": reward,
